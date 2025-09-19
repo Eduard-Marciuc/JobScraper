@@ -3,6 +3,7 @@ from bs4 import BeautifulSoup
 import os
 import json
 import time
+from datetime import datetime
 
 LIBRARY_PATH = "Library"
 READING_LIST_FILE = "readinglist.txt"
@@ -21,13 +22,12 @@ def load_metadata(book_path):
 def save_metadata(book_path, metadata):
     with open(os.path.join(book_path, "metadata.json"), "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
- 
+
 def load_reading_list():
     reading_list = {}
     if not os.path.exists(READING_LIST_FILE):
-        print(f"No {READING_LIST_FILE} found. Please create one with 'Title,URL' lines.")
+        print(f"No {READING_LIST_FILE} found. Please create one with 'Name,URL' lines.")
         return reading_list
-
     with open(READING_LIST_FILE, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -36,7 +36,7 @@ def load_reading_list():
             title, url = line.split(",", 1)
             title, url = title.strip(), url.strip()
             if title in reading_list:
-                print(f"Duplicate entry for '{title}' found in {READING_LIST_FILE}, skipping duplicate.")
+                print(f"Duplicate entry for '{title}' found in {READING_LIST_FILE}, skipping.")
                 continue
             reading_list[title] = url
     return reading_list
@@ -52,29 +52,55 @@ def scrape_book(title, url):
     r = requests.get(url, headers=HEADERS)
     soup = BeautifulSoup(r.text, "html.parser")
 
-    toc_rows = soup.select("table tbody tr.chapter-row")
-    print(f"  Found {len(toc_rows)} rows in TOC")
+    toc_rows = soup.select("table tbody tr")
+    print(f"  Found {len(toc_rows)} rows in contents")
 
     new_chapters = []
+    volume_map = {}
+
     for row in toc_rows:
+        if "chapter-row" not in row.get("class", []):
+            continue
+
         link = row.select_one("a[href]")
         if not link:
             continue
 
         chapter_url = "https://www.royalroad.com" + link["href"]
-        chapter_title = link.get_text(strip=True)
+        if chapter_url in known_chapters:
+            continue
 
-        if chapter_url not in known_chapters:
-            new_chapters.append((chapter_title, chapter_url))
+        chapter_title = link.get_text(strip=True)
+        volume_id = row.get("data-volume-id", "unknown")
+        if volume_id not in volume_map:
+            volume_map[volume_id] = f"Volume {len(volume_map)+1}"
+        volume_name = volume_map[volume_id]
+
+        time_elem = row.select_one("td.text-right time")
+        if time_elem and time_elem.has_attr("datetime"):
+            date_published = datetime.fromisoformat(time_elem["datetime"].replace("Z", "+00:00"))
+        else:
+            date_published = None
+
+        new_chapters.append({
+            "title": chapter_title,
+            "url": chapter_url,
+            "volume": volume_name,
+            "volume_id": volume_id,
+            "date": date_published
+        })
 
     if not new_chapters:
         print("No new chapters found.")
         return
 
-    for chapter_title, chapter_url in new_chapters:
-        print(f"Downloading {chapter_title}")
+    new_chapters.sort(key=lambda x: (x["volume"], x["date"] or datetime.min))
 
-        cr = requests.get(chapter_url, headers=HEADERS)
+    for chapter in new_chapters:
+        date_str = chapter["date"].strftime("%Y-%m-%d") if chapter["date"] else "unknown"
+        print(f"Downloading {chapter['title']} ({chapter['volume']}")
+
+        cr = requests.get(chapter["url"], headers=HEADERS)
         csoup = BeautifulSoup(cr.text, "html.parser")
 
         content_elem = csoup.select_one(".chapter-content")
@@ -84,15 +110,21 @@ def scrape_book(title, url):
 
         content = content_elem.get_text("\n", strip=True)
 
-        safe_title = "".join(x for x in chapter_title if x.isalnum() or x in " _-")
-        filename = os.path.join(book_path, f"{safe_title}.txt")
+        safe_title = "".join(x for x in chapter["title"] if x.isalnum() or x in " _-")
+        safe_volume = "".join(x for x in chapter["volume"] if x.isalnum() or x in " _-")
 
+        vol_path = os.path.join(book_path, safe_volume)
+        os.makedirs(vol_path, exist_ok=True)
+
+        filename = os.path.join(vol_path, f"{safe_title}.txt")
         with open(filename, "w", encoding="utf-8") as f:
             f.write(content)
 
         metadata["chapters"].append({
-            "title": chapter_title,
-            "url": chapter_url,
+            "title": chapter["title"],
+            "url": chapter["url"],
+            "volume": chapter["volume"],
+            "date": chapter["date"].isoformat() if chapter["date"] else None,
             "read": False
         })
 
